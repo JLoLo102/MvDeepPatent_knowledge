@@ -1,0 +1,160 @@
+# -*- coding:utf-8 -*-
+
+import shutil
+from pathlib import Path
+from collections import defaultdict
+from tqdm import tqdm
+
+# =====================================================
+# CONFIG
+# =====================================================
+
+SRC_ROOT = Path("/selected_527/reproduce")
+DST_ROOT = Path("/selected_527/reproduce_v2")
+
+CHECK_FILE = "patent_category_explanation.json"
+
+# =====================================================
+# MAIN
+# =====================================================
+
+def main():
+
+    total_patents = 0
+    copied_patents = 0
+    skipped_patents = 0
+
+    # 每个类别统计
+    category_stat = defaultdict(lambda: {
+        "total": 0,
+        "copied": 0,
+        "skipped": 0
+    })
+
+    # 遍历类别
+    for category_dir in tqdm(
+            sorted(SRC_ROOT.iterdir()),
+            desc="Processing Categories"):
+
+        if not category_dir.is_dir():
+            continue
+
+        category_name = category_dir.name
+
+        dst_category = DST_ROOT / category_name
+        dst_category.mkdir(parents=True, exist_ok=True)
+
+        # 遍历专利
+        for patent_dir in sorted(category_dir.iterdir()):
+
+            if not patent_dir.is_dir():
+                continue
+
+            total_patents += 1
+            category_stat[category_name]["total"] += 1
+
+            json_path = patent_dir / CHECK_FILE
+
+            # 没有生成 explanation
+            if not json_path.exists():
+
+                skipped_patents += 1
+                category_stat[category_name]["skipped"] += 1
+                continue
+
+            dst_patent = dst_category / patent_dir.name
+
+            # 已存在则跳过复制
+            if not dst_patent.exists():
+
+                shutil.copytree(
+                    patent_dir,
+                    dst_patent,
+                    dirs_exist_ok=True
+                )
+
+            copied_patents += 1
+            category_stat[category_name]["copied"] += 1
+
+    # =====================================================
+    # OUTPUT
+    # =====================================================
+
+    print("\n")
+    print("=" * 80)
+    print("Overall Statistics")
+    print("=" * 80)
+
+    print(f"Total Patents : {total_patents}")
+    print(f"Copied        : {copied_patents}")
+    print(f"Skipped       : {skipped_patents}")
+
+    if total_patents > 0:
+        print(f"Retention     : {copied_patents / total_patents * 100:.2f}%")
+
+    print(f"\nSave Path:")
+    print(DST_ROOT)
+
+    print("=" * 80)
+
+    # =====================================================
+    # CATEGORY STATISTICS
+    # =====================================================
+
+    print("\nPer-category Statistics\n")
+
+    print("{:<25s}{:>10s}{:>10s}{:>10s}{:>12s}".format(
+        "Category",
+        "Total",
+        "Copied",
+        "Skipped",
+        "Retention"
+    ))
+
+    print("-" * 70)
+
+    total_total = 0
+    total_copy = 0
+    total_skip = 0
+
+    for category in sorted(category_stat.keys()):
+
+        total = category_stat[category]["total"]
+        copied = category_stat[category]["copied"]
+        skipped = category_stat[category]["skipped"]
+
+        total_total += total
+        total_copy += copied
+        total_skip += skipped
+
+        retention = copied / total * 100 if total > 0 else 0
+
+        print("{:<25s}{:>10d}{:>10d}{:>10d}{:>11.2f}%".format(
+            category,
+            total,
+            copied,
+            skipped,
+            retention
+        ))
+
+    print("-" * 70)
+
+    overall_retention = total_copy / total_total * 100 if total_total > 0 else 0
+
+    print("{:<25s}{:>10d}{:>10d}{:>10d}{:>11.2f}%".format(
+        "TOTAL",
+        total_total,
+        total_copy,
+        total_skip,
+        overall_retention
+    ))
+
+    print("=" * 80)
+
+
+# =====================================================
+# ENTRY
+# =====================================================
+
+if __name__ == "__main__":
+    main()
