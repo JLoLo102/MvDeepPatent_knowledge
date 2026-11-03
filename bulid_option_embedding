@@ -1,0 +1,125 @@
+# -*-coding:utf-8-*-
+# -*-coding:utf-8-*-
+import os
+import json
+import torch
+from tqdm import tqdm
+from transformers import AutoTokenizer, AutoModel
+
+# =========================
+# CONFIG
+# =========================
+DATASET_ROOT = "*/selected_527/new_train_knowledge"
+MODEL_NAME = "*/models/Qwem3-Embedding-4B"
+
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
+# =========================
+# LOAD MODEL
+# =========================
+print("Loading model...")
+
+tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True)
+model = AutoModel.from_pretrained(
+    MODEL_NAME,
+    torch_dtype=torch.float16,
+    trust_remote_code=True
+).to(DEVICE)
+
+model.eval()
+
+
+# =========================
+# ENCODE (CLS token recommended)
+# =========================
+@torch.no_grad()
+def encode(text):
+    if text is None or len(text.strip()) == 0:
+        return None
+
+    inputs = tokenizer(
+        text,
+        return_tensors="pt",
+        truncation=True,
+        padding=True
+    ).to(DEVICE)
+
+    outputs = model(**inputs)
+
+    # CLS embedding (更稳定，比mean好)
+    emb = outputs.last_hidden_state[0, 0]  # [D]
+
+    return emb.cpu()
+
+
+# =========================
+# MAIN LOOP
+# =========================
+print("Processing dataset...")
+
+for category in os.listdir(DATASET_ROOT):
+    category_path = os.path.join(DATASET_ROOT, category)
+
+    if not os.path.isdir(category_path):
+        continue
+
+    for patent in tqdm(os.listdir(category_path), desc=f"Category {category}"):
+
+        patent_path = os.path.join(category_path, patent)
+
+        if not os.path.isdir(patent_path):
+            continue
+
+        json_path = os.path.join(patent_path, "patent_category_explanation.json")
+
+        if not os.path.exists(json_path):
+            continue
+
+        try:
+            with open(json_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+
+            if not any(data.values()):
+                continue
+
+            # =========================
+            # SEPARATE TEXT
+            # =========================
+            intent_text = data.get("Intent", "")
+            obs_text = data.get("Observation", "")
+            reason_text = data.get("Reasoning", "")
+            cate_text = data.get("Category_Explanation", "")
+
+            # =========================
+            # ENCODE EACH
+            # =========================
+            intent_emb = encode(intent_text)
+            obs_emb = encode(obs_text)
+            reason_emb = encode(reason_text)
+            cate_emb = encode(cate_text)
+
+            # =========================
+            # SAVE PATHS
+            # =========================
+            intent_path = os.path.join(patent_path, "intent.pt")
+            obs_path = os.path.join(patent_path, "observation.pt")
+            reason_path = os.path.join(patent_path, "reasoning.pt")
+            cate_path = os.path.join(patent_path, "category.pt")
+
+            # =========================
+            # SAVE FILES
+            # =========================
+            if intent_emb is not None:
+                torch.save({"embedding": intent_emb, "text": intent_text}, intent_path)
+
+            if obs_emb is not None:
+                torch.save({"embedding": obs_emb, "text": obs_text}, obs_path)
+
+            if reason_emb is not None:
+                torch.save({"embedding": reason_emb, "text": reason_text}, reason_path)
+
+            if cate_emb is not None:
+                torch.save({"embedding": cate_emb, "text": cate_text}, cate_path)
+
+        except Exception as e:
+            print(f"Skip {patent_path}: {e}")
