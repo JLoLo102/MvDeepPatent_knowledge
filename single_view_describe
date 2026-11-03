@@ -1,0 +1,350 @@
+# -*-coding:utf-8-*-
+import os
+import re
+import json
+from pathlib import Path
+
+import torch
+from PIL import Image
+from tqdm import tqdm
+
+from transformers import Qwen2_5_VLForConditionalGeneration, AutoProcessor
+
+
+# =========================
+# CONFIG
+# =========================
+
+DATASET_ROOT = "/selected_527/reproduce"
+MODEL_NAME = "/models/Qwen2.5-VL-7B-Instruct"
+SAVE_NAME = "patent_reasoning_source.json"
+ERROR_LOG = "error_log.txt"
+
+
+# =========================
+# VIEW PARSER
+# =========================
+
+def extract_view_type(text: str):
+
+    text = text.lower()
+
+    # patterns = [
+    #     "front perspective view",
+    #     "rear perspective view",
+    #     "front view",
+    #     "rear view",
+    #     "left side view",
+    #     "right side view",
+    #     "top plan view",
+    #     "bottom plan view",
+    #     "top view",
+    #     "bottom view",
+    # ]
+
+    patterns = [
+        "front perspective view",
+        "rear perspective view",
+        "left side view",
+        "right side view",
+        "front view",
+        "rear view",
+        "top plan view",
+        "bottom plan view",
+        "top view",
+        "bottom view",
+        "perspective view",
+        "enlarged view",
+        "partial view"
+    ]
+
+    for p in patterns:
+        if p in text:
+            return p.title()
+
+    return "Unknown View"
+
+
+# =========================
+# LOAD MODEL
+# =========================
+
+print("Loading Qwen2.5-VL...")
+
+model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+    MODEL_NAME,
+    torch_dtype=torch.bfloat16,
+    device_map="auto",
+    offload_folder="./offload",
+    local_files_only=True
+)
+
+processor = AutoProcessor.from_pretrained(MODEL_NAME,local_files_only=True)
+
+print("Model loaded.")
+
+
+# =========================
+# PROMPT
+# =========================
+
+def build_prompt(view_types):
+
+    prompt = """
+You are a professional design patent visual analyst.
+
+You will be given multiple images of the SAME patent.
+
+Each image corresponds to one view.
+
+For each image:
+
+- Describe ONLY visible geometric structure
+- Describe layout, contour, symmetry, holes, slots
+- Do NOT infer function
+- Do NOT infer category
+- Do NOT infer design intent
+
+Output format strictly:
+
+Image 1:
+...
+
+Image 2:
+...
+
+One paragraph per image.
+"""
+
+    # prompt = """
+    # You are a professional design patent visual analyst.
+    #
+    # The images correspond to different views of the SAME design patent.
+    #
+    # For EACH image separately:
+    #
+    # 1. Describe the overall shape.
+    # 2. Describe major geometric components.
+    # 3. Describe openings, slots, grooves, protrusions.
+    # 4. Describe symmetry and repetition patterns.
+    # 5. Describe relative arrangement of visual elements.
+    #
+    # Do NOT:
+    # - infer category
+    # - infer function
+    # - infer usage
+    # - infer design intent
+    #
+    # Output exactly:
+    #
+    # Image 1:
+    # ...
+    #
+    # Image 2:
+    # ...
+    #
+    # Image 3:
+    # ...
+    # """
+
+    prompt += "\nView Types:\n"
+
+    for i, v in enumerate(view_types, 1):
+        prompt += f"Image {i}: {v}\n"
+
+    return prompt
+
+
+# =========================
+# PARSE OUTPUT
+# =========================
+
+def parse_output(text, n):
+
+    results = []
+
+    for i in range(1, n + 1):
+
+        pattern = rf"Image\s*{i}\s*:(.*?)(?=Image\s*{i+1}\s*:|$)"
+
+        match = re.search(pattern, text, re.S | re.I)
+
+        if match:
+            results.append(match.group(1).strip())
+        else:
+            results.append("")
+
+    return results
+
+
+# =========================
+# COLLECT PATENTS
+# =========================
+
+def collect_patents(root):
+
+    patents = []
+
+    root = Path(root)
+
+    for category_dir in root.iterdir():
+
+        if not category_dir.is_dir():
+            continue
+
+        category = category_dir.name
+
+        for patent_dir in category_dir.iterdir():
+
+            if patent_dir.is_dir():
+
+                patents.append((category, patent_dir))
+
+    return patents
+
+
+# =========================
+# GENERATE ONE PATENT
+# =========================
+
+@torch.no_grad()
+def process_patent(category, patent_dir):
+
+    save_path = patent_dir / SAVE_NAME
+
+    if save_path.exists():
+        return
+
+    jpgs = sorted(list(patent_dir.glob("*.png")))
+
+    if len(jpgs) == 0:
+        return
+
+    images = []
+    view_types = []
+    image_names = []
+
+    for img_path in jpgs:
+
+        txt_path = img_path.with_suffix(".txt")
+
+        raw_caption = txt_path.read_text(encoding="utf-8", errors="ignore") \
+            if txt_path.exists() else "Unknown View"
+
+        view_type = extract_view_type(raw_caption)
+
+        image = Image.open(img_path).convert("RGB")
+        image.thumbnail((224,224))
+        images.append(image)
+        view_types.append(view_type)
+        image_names.append(img_path.name)
+
+    # prompt
+    prompt = build_prompt(view_types)
+
+    content = []
+
+    for img in images:
+        content.append({"type": "image", "image": img})
+
+    content.append({"type": "text", "text": prompt})
+
+    messages = [{"role": "user", "content": content}]
+
+    text = processor.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=True
+    )
+
+    inputs = processor(
+        text=[text],
+        images=images,
+        return_tensors="pt"
+    ).to(model.device)
+
+    outputs = model.generate(
+        **inputs,
+        max_new_tokens=512,
+        do_sample=False
+    )
+
+    generated_ids = [
+        output_ids[len(input_ids):]
+        for input_ids, output_ids in zip(
+            inputs.input_ids,
+            outputs
+        )
+    ]
+
+    result = processor.batch_decode(
+        generated_ids,
+        skip_special_tokens=True,
+        clean_up_tokenization_spaces=False
+    )[0]
+
+
+    descriptions = parse_output(result, len(images))
+
+    # build json
+    patent_json = {
+        "patent_id": patent_dir.name,
+        "category": category,
+        "views": []
+    }
+
+    for img, vt, desc in zip(image_names, view_types, descriptions):
+
+        patent_json["views"].append({
+            "image": img,
+            "view_type": vt,
+            "description": desc
+        })
+
+    with open(save_path, "w", encoding="utf-8") as f:
+        json.dump(patent_json, f, ensure_ascii=False, indent=2)
+
+    print(f"[DONE] {category}/{patent_dir.name}")
+    # =========================
+    # RELEASE GPU MEMORY
+    # =========================
+
+    import gc
+
+    del inputs
+    del outputs
+    del generated_ids
+
+    gc.collect()
+    torch.cuda.empty_cache()
+
+# =========================
+# MAIN
+# =========================
+
+def main():
+
+    patents = collect_patents(DATASET_ROOT)
+
+    print(f"Total patents: {len(patents)}")
+
+    for category, patent_dir in tqdm(patents):
+
+        try:
+            process_patent(category, patent_dir)
+
+        # except Exception as e:
+        #
+        #     with open(ERROR_LOG, "a", encoding="utf-8") as f:
+        #         f.write(f"{patent_dir}\n{str(e)}\n\n")
+        except Exception as e:
+
+            print("\n" + "=" * 80)
+            print(f"ERROR PATENT: {patent_dir}")
+            print(f"ERROR TYPE: {type(e).__name__}")
+            print(f"ERROR MSG : {e}")
+            print("=" * 80 + "\n")
+
+
+if __name__ == "__main__":
+    main()
