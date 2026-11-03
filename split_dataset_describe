@@ -1,0 +1,202 @@
+# -*-coding:utf-8-*-
+# -*- coding:utf-8 -*-
+
+import csv
+import json
+import random
+import shutil
+from pathlib import Path
+from collections import defaultdict
+
+from tqdm import tqdm
+
+# =====================================================
+# CONFIG
+# =====================================================
+
+TRAIN_ROOT = Path("/selected_527/new_train_3D_v2")
+TEST_ROOT = Path("/selected_527/new_test_3D_v2")
+
+SAVE_ROOT = Path("/selected_527_splite")
+
+TRAIN_SAVE = SAVE_ROOT / "new_train_3D"
+TEST_SAVE = SAVE_ROOT / "new_test_3D"
+
+# CSV_SAVE = SAVE_ROOT / "category_statistics.csv"
+# JSON_SAVE = SAVE_ROOT / "split_record.json"
+
+SEED = 42
+
+random.seed(SEED)
+
+# =====================================================
+# SPLIT RULE
+# =====================================================
+
+def split_num(total):
+
+    if total < 6:
+        return 0, 0
+
+    if total == 6:
+        return 4, 2
+
+    if total == 7:
+        return 5, 2
+
+    train_num = round(total * 0.8)
+    test_num = total - train_num
+
+    if test_num == 0:
+        test_num = 1
+        train_num = total - 1
+
+    return train_num, test_num
+
+
+# =====================================================
+# COLLECT
+# =====================================================
+
+category_dict = defaultdict(list)
+
+for root in [TRAIN_ROOT, TEST_ROOT]:
+
+    for category_dir in sorted(root.iterdir()):
+
+        if not category_dir.is_dir():
+            continue
+
+        category = category_dir.name
+
+        for patent_dir in sorted(category_dir.iterdir()):
+
+            if patent_dir.is_dir():
+                category_dict[category].append(patent_dir)
+
+print(f"Collected {len(category_dict)} categories.")
+
+# =====================================================
+# PREPARE SAVE
+# =====================================================
+
+TRAIN_SAVE.mkdir(parents=True, exist_ok=True)
+TEST_SAVE.mkdir(parents=True, exist_ok=True)
+
+statistics = []
+valid_categories = []
+
+split_record = {}
+
+total_category = 0
+total_patent = 0
+
+train_patent = 0
+test_patent = 0
+
+# =====================================================
+# PROCESS
+# =====================================================
+
+for category in tqdm(sorted(category_dict.keys()), desc="Processing"):
+
+    patents = category_dict[category]
+
+    total = len(patents)
+
+    if total < 6:
+        continue
+
+    total_category += 1
+    total_patent += total
+    valid_categories.append(category)
+
+    random.shuffle(patents)
+
+    train_num, test_num = split_num(total)
+
+    train_list = patents[:train_num]
+    test_list = patents[train_num:]
+
+    train_patent += len(train_list)
+    test_patent += len(test_list)
+
+    # ----------------------------
+    # save folders
+    # ----------------------------
+
+    train_category = TRAIN_SAVE / category
+    test_category = TEST_SAVE / category
+
+    train_category.mkdir(parents=True, exist_ok=True)
+    test_category.mkdir(parents=True, exist_ok=True)
+
+    for patent in train_list:
+
+        shutil.copytree(
+            patent,
+            train_category / patent.name,
+            dirs_exist_ok=True
+        )
+
+    for patent in test_list:
+
+        shutil.copytree(
+            patent,
+            test_category / patent.name,
+            dirs_exist_ok=True
+        )
+
+    # ----------------------------
+    # statistics
+    # ----------------------------
+
+    retention = len(train_list) / total * 100
+
+    statistics.append([
+        category,
+        total,
+        len(train_list),
+        len(test_list),
+        "{:.2f}%".format(retention)
+    ])
+
+    split_record[category] = {
+        "train":[p.name for p in train_list],
+        "test":[p.name for p in test_list]
+    }
+
+
+# =====================================================
+# SAVE CATEGORY LIST
+# =====================================================
+
+txt_path = SAVE_ROOT / "category_list.txt"
+
+with open(txt_path, "w", encoding="utf-8") as f:
+    for c in sorted(valid_categories):
+        f.write(c + "\n")
+
+# =====================================================
+# PRINT
+# =====================================================
+
+print("\n")
+print("=" * 80)
+print("Dataset Split Finished")
+print("=" * 80)
+
+print(f"Valid Categories : {total_category}")
+print(f"Total Patents    : {total_patent}")
+print(f"Train Patents    : {train_patent}")
+print(f"Test Patents     : {test_patent}")
+
+print(f"\nTrain Ratio : {train_patent/total_patent:.3f}")
+print(f"Test Ratio  : {test_patent/total_patent:.3f}")
+
+print("\nSaved to:")
+print(TRAIN_SAVE)
+print(TEST_SAVE)
+
+
+print("=" * 80)
