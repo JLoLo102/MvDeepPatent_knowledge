@@ -1,0 +1,354 @@
+# -*- coding:utf-8 -*-
+import gc
+import json
+import re
+from pathlib import Path
+
+import torch
+from transformers import AutoProcessor,Qwen2_5_VLForConditionalGeneration
+
+from tqdm import tqdm
+
+
+# =====================================================
+# CONFIG
+# =====================================================
+
+DATASET_ROOT = "/selected_527/reproduce"
+
+INPUT_JSON = "patent_reasoning_source.json"
+OUTPUT_JSON = "patent_reasoning_chain.json"
+
+MIN_VALID_VIEWS = 1
+
+MODEL_PATH = "/models/Qwen2.5-VL-7B-Instruct"
+
+
+# =====================================================
+# LOAD MODEL
+# =====================================================
+
+print("Loading Qwen...")
+
+processor = AutoProcessor.from_pretrained(
+    MODEL_PATH,
+    local_files_only=True
+)
+
+model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+    MODEL_PATH,
+    torch_dtype=torch.bfloat16,
+    device_map="auto",
+    local_files_only=True
+)
+
+print("Model Loaded.")
+
+
+# =====================================================
+# COLLECT PATENTS
+# =====================================================
+
+def collect_jsons(root):
+
+    root = Path(root)
+
+    return list(root.rglob(INPUT_JSON))
+
+
+# =====================================================
+# EXTRACT VALID DESCRIPTIONS
+# =====================================================
+
+def get_valid_descriptions(data):
+
+    valid = []
+
+    for v in data["views"]:
+
+        desc = v["description"].strip()
+
+        if len(desc) > 30:
+
+            valid.append({
+                "view_type": v["view_type"],
+                "description": desc
+            })
+
+    return valid
+
+
+# =====================================================
+# BUILD PROMPT
+# =====================================================
+
+def build_prompt(valid_views):
+
+    prompt = """
+You are a professional patent analyst.
+
+Given multiple structural descriptions from different views of the SAME design patent.
+
+Generate three sections:
+
+Observation:
+Summarize the overall geometric structure,
+major components,
+symmetry,
+repetition patterns,
+and spatial arrangement.
+
+Reasoning:
+Analyze which structural characteristics are most distinctive.
+Explain why these characteristics are important.
+Discuss how the design can be differentiated from visually similar designs.
+
+Intent:
+Infer the underlying design objective that may have motivated the observed structural arrangement.
+Focus on structural organization rather than function.
+
+Requirements:
+
+- Focus on geometry and structure.
+- Do NOT mention patent category.
+- Do NOT copy descriptions directly.
+- Output exactly:
+
+Observation:
+...
+
+Reasoning:
+...
+
+Intent:
+...
+"""
+
+    prompt += "\n\nView Descriptions:\n\n"
+
+    for idx, view in enumerate(valid_views, 1):
+
+        prompt += (
+            f"View {idx} ({view['view_type']}):\n"
+            f"{view['description']}\n\n"
+        )
+
+    return prompt
+
+
+# =====================================================
+# PARSE OUTPUT
+# =====================================================
+
+def parse_chain(text):
+
+    observation = ""
+    reasoning = ""
+    intent = ""
+
+    obs_match = re.search(
+        r"Observation\s*:(.*?)(?=Reasoning\s*:|$)",
+        text,
+        re.S | re.I
+    )
+
+    rea_match = re.search(
+        r"Reasoning\s*:(.*?)(?=Intent\s*:|$)",
+        text,
+        re.S | re.I
+    )
+
+    int_match = re.search(
+        r"Intent\s*:(.*)$",
+        text,
+        re.S | re.I
+    )
+
+    if obs_match:
+        observation = obs_match.group(1).strip()
+
+    if rea_match:
+        reasoning = rea_match.group(1).strip()
+
+    if int_match:
+        intent = int_match.group(1).strip()
+
+    return observation, reasoning, intent
+
+
+# =====================================================
+# GENERATE
+# =====================================================
+
+@torch.no_grad()
+def generate_chain(valid_views):
+
+    prompt = build_prompt(valid_views)
+
+    # messages = [
+    #     {
+    #         "role": "user",
+    #         "content": prompt
+    #     }
+    # ]
+    #
+    # text = tokenizer.apply_chat_template(
+    #     messages,
+    #     tokenize=False,
+    #     add_generation_prompt=True
+    # )
+    #
+    # inputs = tokenizer(
+    #     text,
+    #     return_tensors="pt"
+    # ).to(model.device)
+
+    messages = [
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": prompt
+          }
+        ]
+      }
+    ]
+
+    text = processor.apply_chat_template(
+      messages,
+      tokenize=False,
+      add_generation_prompt=True
+    )
+
+    inputs = processor(
+      text=[text],
+      return_tensors="pt"
+    ).to(model.device)
+
+    outputs = model.generate(
+        **inputs,
+        max_new_tokens=512,
+        do_sample=False
+    )
+
+    generated_ids = [
+      output_ids[len(input_ids):]
+      for input_ids, output_ids in zip(
+        inputs.input_ids,
+        outputs
+      )
+    ]
+
+    result = processor.batch_decode(
+      generated_ids,
+      skip_special_tokens=True,
+      clean_up_tokenization_spaces=False
+    )[0]
+
+    observation, reasoning, intent = parse_chain(result)
+
+    # ======================
+    # RELEASE MEMORY
+    # ======================
+
+    del outputs
+    del generated_ids
+    del inputs
+    del result
+
+    gc.collect()
+    torch.cuda.empty_cache()
+
+    return observation, reasoning, intent
+
+
+
+# =====================================================
+# PROCESS ONE PATENT
+# =====================================================
+
+def process_patent(json_path):
+
+    save_path = json_path.parent / OUTPUT_JSON
+
+    if save_path.exists():
+        return
+
+    with open(json_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    valid_views = get_valid_descriptions(data)
+
+    # 跳过无效专利
+    if len(valid_views) < MIN_VALID_VIEWS:
+
+        print(
+            f"Skip: {data['patent_id']} "
+            f"(valid views={len(valid_views)})"
+        )
+
+        return
+
+    observation, reasoning, intent = \
+        generate_chain(valid_views)
+
+    result = {
+        "patent_id": data["patent_id"],
+        "category": data["category"],
+        "valid_view_count": len(valid_views),
+        "Observation": observation,
+        "Reasoning": reasoning,
+        "Intent": intent
+    }
+
+    with open(save_path, "w", encoding="utf-8") as f:
+        json.dump(
+            result,
+            f,
+            ensure_ascii=False,
+            indent=2
+        )
+
+    # ======================
+    # RELEASE MEMORY
+    # ======================
+
+    del data
+    del valid_views
+    del observation
+    del reasoning
+    del intent
+    del result
+
+    gc.collect()
+    torch.cuda.empty_cache()
+
+
+# =====================================================
+# MAIN
+# =====================================================
+
+def main():
+
+    json_files = collect_jsons(DATASET_ROOT)
+
+    print("Total patents:", len(json_files))
+
+    for json_path in tqdm(json_files):
+
+        try:
+
+            process_patent(json_path)
+
+        except Exception as e:
+
+            print("=" * 80)
+            print(json_path)
+            print(type(e).__name__)
+            print(e)
+            print("=" * 80)
+
+
+if __name__ == "__main__":
+    main()
