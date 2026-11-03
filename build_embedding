@@ -1,0 +1,111 @@
+# -*-coding:utf-8-*-
+import os
+import json
+import torch
+from tqdm import tqdm
+from transformers import AutoTokenizer, AutoModel
+
+# =========================
+# CONFIG
+# =========================
+DATASET_ROOT = "*/selected_527/new_train_knowledge"
+MODEL_NAME = "*/models/Qwem3-Embedding-4B"
+
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
+
+# =========================
+# LOAD MODEL
+# =========================
+print("Loading model...")
+
+tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True)
+model = AutoModel.from_pretrained(
+    MODEL_NAME,
+    torch_dtype=torch.float16,
+    trust_remote_code=True
+).to(DEVICE)
+
+model.eval()
+
+
+# =========================
+# BUILD PROMPT
+# =========================
+def build_prompt(data):
+    return (
+        f"[Intent]: {data.get('Intent', '')}\n"
+        f"[Observation]: {data.get('Observation', '')}\n"
+        f"[Reasoning]: {data.get('Reasoning', '')}\n"
+        f"[Category]: {data.get('Category_Explanation', '')}"
+    )
+
+
+# =========================
+# ENCODE
+# =========================
+@torch.no_grad()
+def encode(text):
+    inputs = tokenizer(
+        text,
+        padding=True,
+        return_tensors="pt",
+        truncation=True,
+
+    ).to(DEVICE)
+
+    outputs = model(**inputs)
+
+    emb = outputs.last_hidden_state.mean(dim=1)
+
+    return emb.squeeze(0).cpu()
+
+
+# =========================
+# MAIN LOOP
+# =========================
+print("Processing dataset...")
+
+for category in os.listdir(DATASET_ROOT):
+    category_path = os.path.join(DATASET_ROOT, category)
+
+    if not os.path.isdir(category_path):
+        continue
+
+    for patent in tqdm(os.listdir(category_path), desc=f"Category {category}"):
+
+        patent_path = os.path.join(category_path, patent)
+
+        if not os.path.isdir(patent_path):
+            continue
+
+        json_path = os.path.join(patent_path, "patent_category_explanation.json")
+
+        if not os.path.exists(json_path):
+            continue
+
+        try:
+            # load json
+            with open(json_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+
+            # skip empty
+            if not any(data.values()):
+                continue
+
+            # build prompt
+            prompt = build_prompt(data)
+
+            # embedding
+            emb = encode(prompt)
+
+            # save path (存到专利目录下)
+            save_path = os.path.join(patent_path, "knowledge_embedding.pt")
+
+            torch.save({
+                "embedding": emb,
+                "prompt": prompt
+            }, save_path)
+
+        except Exception as e:
+            print(f"Skip {patent_path}: {e}")
