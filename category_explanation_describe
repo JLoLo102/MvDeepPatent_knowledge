@@ -1,0 +1,228 @@
+# -*-coding:utf-8-*-
+# -*- coding:utf-8 -*-
+import gc
+import json
+from pathlib import Path
+
+import torch
+from tqdm import tqdm
+
+from transformers import Qwen2_5_VLForConditionalGeneration, AutoProcessor
+
+# =====================================================
+# CONFIG
+# =====================================================
+
+INPUT_ROOT = "/selected_527/reproduce"
+INPUT_JSON = "patent_reasoning_chain.json"
+OUTPUT_JSON = "patent_category_explanation.json"
+
+MODEL_PATH = "/models/Qwen2.5-VL-7B-Instruct"
+
+MIN_FIELDS = ["Observation", "Reasoning", "Intent"]
+
+# =====================================================
+# LOAD MODEL (VL VERSION)
+# =====================================================
+
+print("Loading Qwen2.5-VL...")
+
+model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+    MODEL_PATH,
+    torch_dtype=torch.bfloat16,
+    device_map="auto",
+    local_files_only=True
+)
+
+processor = AutoProcessor.from_pretrained(
+    MODEL_PATH,
+    local_files_only=True
+)
+
+print("Model loaded.")
+
+# =====================================================
+# COLLECT FILES
+# =====================================================
+
+def collect_jsons(root):
+    root = Path(root)
+    return list(root.rglob(INPUT_JSON))
+
+
+# =====================================================
+# VALIDATION
+# =====================================================
+
+def is_valid(data):
+    for k in MIN_FIELDS:
+        if k not in data or len(str(data[k]).strip()) < 10:
+            return False
+    return True
+
+
+# =====================================================
+# PROMPT
+# =====================================================
+
+def build_prompt(data):
+
+    return f"""
+You are a senior patent examiner.
+
+You are given a structured reasoning chain of a design patent.
+
+--------------------------------
+Observation:
+{data['Observation']}
+
+Reasoning:
+{data['Reasoning']}
+
+Intent:
+{data['Intent']}
+
+Ground Truth Category:
+{data['category']}
+--------------------------------
+
+Task:
+Explain why this design patent belongs to this category.
+
+Requirements:
+- Focus on structural and geometric reasoning
+- Do NOT mention images or views
+- Do NOT copy input text
+- Do NOT hallucinate new categories
+- Output ONLY final explanation
+
+Output format:
+
+Category Explanation:
+...
+"""
+
+
+# =====================================================
+# GENERATION
+# =====================================================
+
+@torch.no_grad()
+def generate(prompt):
+
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "text",
+                    "text": prompt
+                }
+            ]
+        }
+    ]
+
+    text = processor.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=True
+    )
+
+    inputs = processor(
+        text=[text],
+        return_tensors="pt"
+    ).to(model.device)
+
+    outputs = model.generate(
+        **inputs,
+        max_new_tokens=512,
+        do_sample=False
+    )
+
+    gen_ids = outputs[:, inputs.input_ids.shape[1]:]
+
+    result = processor.batch_decode(
+        gen_ids,
+        skip_special_tokens=True
+    )[0]
+
+    # ===== memory cleanup =====
+    del inputs
+    del outputs
+    del gen_ids
+    gc.collect()
+    torch.cuda.empty_cache()
+
+    return result
+
+
+# =====================================================
+# PROCESS SINGLE PATENT
+# =====================================================
+
+def process(json_path):
+
+    save_path = json_path.parent / OUTPUT_JSON
+
+    if save_path.exists():
+        return
+
+    with open(json_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    if not is_valid(data):
+        print(f"Skip invalid: {data.get('patent_id', json_path)}")
+        return
+
+    prompt = build_prompt(data)
+
+    result = generate(prompt)
+
+    out = {
+        "patent_id": data.get("patent_id"),
+        "category": data.get("category"),
+        "Category_Explanation": result,
+
+        # 保留三阶段链（很重要）
+        "Observation": data["Observation"],
+        "Reasoning": data["Reasoning"],
+        "Intent": data["Intent"]
+    }
+
+    with open(save_path, "w", encoding="utf-8") as f:
+        json.dump(out, f, ensure_ascii=False, indent=2)
+
+    # ===== cleanup =====
+    del data
+    del prompt
+    del result
+    del out
+    gc.collect()
+    torch.cuda.empty_cache()
+
+
+# =====================================================
+# MAIN
+# =====================================================
+
+def main():
+
+    files = collect_jsons(INPUT_ROOT)
+
+    print("Total patents:", len(files))
+
+    for f in tqdm(files):
+
+        try:
+            process(f)
+
+        except Exception as e:
+            print("=" * 80)
+            print("ERROR:", f)
+            print(type(e).__name__)
+            print(e)
+            print("=" * 80)
+
+
+if __name__ == "__main__":
+    main()
